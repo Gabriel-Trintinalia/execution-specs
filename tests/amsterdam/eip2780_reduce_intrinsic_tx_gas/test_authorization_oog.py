@@ -938,6 +938,194 @@ def test_reservoir_settlement_with_value_to_empty_recipient(
 
 
 @pytest.mark.parametrize(
+    "outcome",
+    [
+        pytest.param("oog_exact", id="regular_exhausted_exact_combined"),
+        pytest.param(
+            "oog_headroom", id="regular_exhausted_reservoir_headroom"
+        ),
+        pytest.param("succeeds", id="regular_exact_fit"),
+    ],
+)
+def test_regular_only_auth_charges_cannot_draw_reservoir(
+    fork: Fork,
+    pre: Alloc,
+    state_test: StateTestFiller,
+    outcome: str,
+) -> None:
+    """
+    Regular-only ``set_delegation`` charges must never draw from the
+    state-gas reservoir.
+
+    Every authorization re-points an already-delegated authority to its
+    same target, so ``set_delegation`` skips ``NEW_ACCOUNT`` (the
+    account exists) and ``AUTH_BASE`` (it was delegated before the
+    transaction) and charges exactly the regular ``ACCOUNT_WRITE`` --
+    no state gas at all. The two out-of-gas cases pick an authorization
+    count whose cumulative charge exceeds the regular grant (cap minus
+    intrinsic) alone; because ``charge_gas`` cannot spend the
+    reservoir, ``set_delegation`` runs out mid-loop, the preparation
+    snapshot rolls every delegation back, and the untouched reservoir
+    is returned whole: ``gas_used == cap`` exactly. An implementation
+    that checks the cumulative per-authorization charges against one
+    combined regular-plus-reservoir pool instead sails past the regular
+    exhaustion, applies every delegation, and forks on the state root.
+
+    - ``regular_exhausted_exact_combined``: ``gas_limit`` is the
+      intrinsic cost plus every ``ACCOUNT_WRITE``, so the combined
+      budget covers the preparation exactly and only the regular/state
+      split makes it starve -- the sharpest boundary a combined-pool
+      implementation can be probed at.
+    - ``regular_exhausted_reservoir_headroom``: the reservoir is
+      requested explicitly with one million gas beyond the regular
+      shortfall, pinning that even ample combined headroom must not
+      keep a regular-only charge alive.
+    - ``regular_exact_fit``: two fewer authorizations keep
+      ``gas_limit`` at or below the cap -- no reservoir, the regular
+      grant fits the charges exactly, and every delegation applies with
+      ``gas_used == gas_limit``. This pins the boundary from below.
+    """
+    cap = fork.transaction_gas_limit_cap()
+    assert cap is not None, "EIP-7825 cap expected on this fork"
+    gas_costs = fork.gas_costs()
+
+    sender = pre.fund_eoa()
+    recipient = pre.deploy_contract(code=Op.STOP)
+    delegation_target = pre.deploy_contract(code=Op.STOP)
+
+    def delegated_authority() -> EOA:
+        """Fund an authority already delegated to the shared target."""
+        return pre.fund_eoa(
+            amount=EOA_INITIAL_BALANCE, delegation=delegation_target
+        )
+
+    def same_delegation_authorization(authority: EOA) -> AuthorizationTuple:
+        """Authorization re-pointing an authority at its own target."""
+        return AuthorizationTuple(
+            address=delegation_target,
+            nonce=1,
+            signer=authority,
+            creates_account=False,
+            writes_delegation=False,
+        )
+
+    probe_authority = delegated_authority()
+    probe = same_delegation_authorization(probe_authority)
+    base_intrinsic = _intrinsic_regular(
+        fork, [], recipient_type=RecipientType.CONTRACT
+    )
+    per_auth_intrinsic = (
+        _intrinsic_regular(
+            fork, [probe], recipient_type=RecipientType.CONTRACT
+        )
+        - base_intrinsic
+    )
+    per_auth_regular = fork.transaction_top_frame_gas_calculator()(
+        recipient_type=RecipientType.CONTRACT,
+        authorizations=[probe],
+    )
+    per_auth_state = fork.transaction_top_frame_state_gas(
+        recipient_type=RecipientType.CONTRACT,
+        authorizations=[probe],
+    )
+    assert per_auth_state == 0, (
+        "a same-delegation authorization must cost no state gas"
+    )
+    assert per_auth_regular == gas_costs.ACCOUNT_WRITE
+
+    # The smallest authorization count whose exact-fit gas limit
+    # exceeds the cap, plus one more so the reservoir is larger than a
+    # single authorization's charge; one fewer keeps the exact fit at
+    # or below the cap.
+    min_count = (cap - base_intrinsic) // (
+        per_auth_intrinsic + per_auth_regular
+    ) + 1
+    auth_count = min_count - 1 if outcome == "succeeds" else min_count + 1
+
+    authorities = [probe_authority] + [
+        delegated_authority() for _ in range(auth_count - 1)
+    ]
+    authorization_list = [probe] + [
+        same_delegation_authorization(authority)
+        for authority in authorities[1:]
+    ]
+
+    intrinsic_regular = base_intrinsic + auth_count * per_auth_intrinsic
+    exact_gas_limit = intrinsic_regular + auth_count * per_auth_regular
+
+    if outcome == "succeeds":
+        assert exact_gas_limit <= cap
+        gas_kwargs = {"gas_limit": exact_gas_limit}
+        expected_gas_used = exact_gas_limit
+    else:
+        # The regular grant alone does not cover the charges.
+        assert exact_gas_limit > cap
+        assert exact_gas_limit - cap > per_auth_regular, (
+            "the reservoir must exceed one authorization's charge"
+        )
+        if outcome == "oog_exact":
+            # The combined budget covers every charge exactly.
+            gas_kwargs = {"gas_limit": exact_gas_limit}
+        else:
+            # The combined budget holds a million gas of headroom
+            # beyond the regular shortfall.
+            shortfall = exact_gas_limit - cap
+            gas_kwargs = {"state_gas_reservoir": shortfall + 1_000_000}
+        expected_gas_used = cap
+
+    tx = Transaction(
+        sender=sender,
+        to=recipient,
+        value=0,
+        authorization_list=authorization_list,
+        expected_receipt=TransactionReceipt(
+            cumulative_gas_used=expected_gas_used,
+        ),
+        **gas_kwargs,
+    )
+
+    designation = Spec7702.delegation_designation(delegation_target)
+    original_authority = Account(
+        nonce=1, balance=EOA_INITIAL_BALANCE, code=designation
+    )
+    applied_authority = Account(
+        nonce=2, balance=EOA_INITIAL_BALANCE, code=designation
+    )
+
+    # All authorities are read during authorization validation, so they
+    # always appear in the block access list; the recipient is only
+    # loaded once preparation reaches the dispatch charge. The applied
+    # delegation writes the same code the authority already holds, so
+    # only the nonce bump is asserted.
+    if outcome != "succeeds":
+        post = dict.fromkeys(authorities, original_authority)
+        expected_block_access_list = BlockAccessListExpectation(
+            account_expectations={
+                recipient: None,
+                **dict.fromkeys(authorities, BalAccountExpectation.empty()),
+            }
+        )
+    else:
+        post = dict.fromkeys(authorities, applied_authority)
+        authority_bal = BalAccountExpectation(
+            nonce_changes=[BalNonceChange(block_access_index=1, post_nonce=2)],
+        )
+        expected_block_access_list = BlockAccessListExpectation(
+            account_expectations={
+                recipient: BalAccountExpectation.empty(),
+                **dict.fromkeys(authorities, authority_bal),
+            }
+        )
+
+    state_test(
+        pre=pre,
+        tx=tx,
+        post=post,
+        expected_block_access_list=expected_block_access_list,
+    )
+
+
+@pytest.mark.parametrize(
     "value",
     [pytest.param(0, id="no_value"), pytest.param(1, id="with_value")],
 )
